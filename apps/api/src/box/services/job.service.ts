@@ -235,33 +235,38 @@ export class JobService {
     errorMessage?: string,
     resultMetadata?: string,
   ): Promise<Job> {
-    const job = await this.findOne(jobId)
-    if (!job) {
-      throw new NotFoundException(`Job with ID ${jobId} not found`)
-    }
+    const updatedJob = await this.jobRepository.manager.transaction(async (manager) => {
+      const job = await manager.findOne(Job, {
+        where: { id: jobId },
+        lock: { mode: 'pessimistic_write' },
+      })
+      if (!job) {
+        throw new NotFoundException(`Job with ID ${jobId} not found`)
+      }
 
-    if (!this.isValidStatusTransition(job.status, status)) {
-      throw new ConflictException(`Invalid job status transition from ${job.status} to ${status} for job ${jobId}`)
-    }
+      if (!this.isValidStatusTransition(job.status, status)) {
+        throw new ConflictException(`Invalid job status transition from ${job.status} to ${status} for job ${jobId}`)
+      }
 
-    job.status = status
-    if (errorMessage) {
-      job.errorMessage = errorMessage
-    }
+      job.status = status
+      if (errorMessage) {
+        job.errorMessage = errorMessage
+      }
 
-    if (status === JobStatus.IN_PROGRESS && !job.startedAt) {
-      job.startedAt = new Date()
-    }
+      if (status === JobStatus.IN_PROGRESS && !job.startedAt) {
+        job.startedAt = new Date()
+      }
 
-    if (status === JobStatus.COMPLETED || status === JobStatus.FAILED) {
-      job.completedAt = new Date()
-    }
+      if (status === JobStatus.COMPLETED || status === JobStatus.FAILED) {
+        job.completedAt = new Date()
+      }
 
-    if (resultMetadata) {
-      job.resultMetadata = resultMetadata
-    }
+      if (resultMetadata) {
+        job.resultMetadata = resultMetadata
+      }
 
-    const updatedJob = await this.jobRepository.save(job)
+      return manager.save(Job, job)
+    })
     this.logger.debug(`Updated job ${jobId} status to ${status}`)
 
     // Handle job completion for v2 runners - update box, artifact, or backup state.
@@ -469,24 +474,40 @@ export class JobService {
       return []
     }
 
-    // Update jobs to IN_PROGRESS
+    // Claim each job with a conditional UPDATE rather than a read-modify-write.
+    //
+    // `save()` does NOT check the @VersionColumn: TypeORM only enforces
+    // optimistic locking when a row is read with `lock: {mode: 'optimistic'}`,
+    // and its UPDATE predicate is the id alone. Two overlapping polls could
+    // therefore both read the same PENDING job and both "claim" it, handing the
+    // same work out twice — and the reconciliation path keys off `startedAt`
+    // written here, so a second claim also moves that clock.
+    //
+    // `status = PENDING` in the WHERE clause makes the claim a compare-and-swap:
+    // exactly one writer sees `affected === 1`. A real database error now
+    // propagates instead of being reported as a lost race.
     const now = new Date()
     const claimedJobs: JobDto[] = []
 
     for (const job of jobs) {
-      try {
-        job.status = JobStatus.IN_PROGRESS
-        job.startedAt = now
-        job.updatedAt = now
+      const claim = await this.jobRepository
+        .createQueryBuilder()
+        .update(Job)
+        .set({ status: JobStatus.IN_PROGRESS, startedAt: now, updatedAt: now })
+        .where('id = :id', { id: job.id })
+        .andWhere('status = :pending', { pending: JobStatus.PENDING })
+        .returning('*')
+        .execute()
 
-        // save() with @VersionColumn will automatically check version and throw OptimisticLockVersionMismatchError if changed
-        const savedJob = await this.jobRepository.save(job)
-
-        claimedJobs.push(new JobDto(savedJob))
-      } catch (error) {
-        // If optimistic lock fails, job was already claimed by another runner - skip it
-        this.logger.debug(`Job ${job.id} already claimed by another runner (version mismatch)`)
+      const claimedRow = (claim.raw as Job[])[0]
+      if (!claim.affected || !claimedRow) {
+        this.logger.debug(`Job ${job.id} was already claimed by a concurrent poll`)
+        continue
       }
+
+      // RETURNING * yields a plain pg row; hydrate it into a real Job so JobDto
+      // reads entity properties rather than whatever the driver handed back.
+      claimedJobs.push(new JobDto(this.jobRepository.create(claimedRow)))
     }
 
     if (claimedJobs.length > 0) {
