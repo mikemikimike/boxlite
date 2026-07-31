@@ -76,6 +76,11 @@ pub struct CBoxInfo {
     pub auto_delete: u32,
     pub auto_resume: c_int,
     pub created_at: i64,
+    /// Unix milliseconds of the successful guest `Container.Start` for the
+    /// lifecycle that owns [`Self::pid`]; `0` when this box's init was never
+    /// launched. Milliseconds — not `created_at`'s seconds — because a caller
+    /// comparing this against a job's timeline needs sub-second resolution.
+    pub started_at_unix_ms: i64,
     /// Owned typed network metadata; null when network metadata is unavailable.
     pub network: *mut CNetworkInfo,
 }
@@ -243,6 +248,7 @@ impl CBoxInfo {
             auto_delete: info.auto_delete,
             auto_resume: if info.auto_resume { 1 } else { 0 },
             created_at: info.created_at.timestamp(),
+            started_at_unix_ms: info.started_at.map(|at| at.timestamp_millis()).unwrap_or(0),
         }
     }
 }

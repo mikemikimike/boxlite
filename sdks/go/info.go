@@ -53,6 +53,11 @@ type BoxInfo struct {
 	AutoDelete uint32
 	AutoResume bool
 	CreatedAt  time.Time
+	// StartedAt is when the guest's Container.Start returned success for the
+	// lifecycle that owns PID; the zero time means this box's init was never
+	// launched. State alone cannot answer that — a box reports Running from
+	// the moment its VM is up, which is before its init is started.
+	StartedAt time.Time
 }
 
 // Info returns information about the box.
@@ -141,6 +146,10 @@ func (r *Runtime) GetInfo(ctx context.Context, idOrName string) (*BoxInfo, error
 
 func cBoxInfoToGo(info *C.CBoxInfo) BoxInfo {
 	pid := int(info.pid)
+	var boxStartedAt time.Time
+	if ms := int64(info.started_at_unix_ms); ms > 0 {
+		boxStartedAt = time.UnixMilli(ms)
+	}
 	return BoxInfo{
 		ID:         cString(info.id),
 		Name:       cString(info.name),
@@ -155,6 +164,8 @@ func cBoxInfoToGo(info *C.CBoxInfo) BoxInfo {
 		AutoDelete: uint32(info.auto_delete),
 		AutoResume: info.auto_resume != 0,
 		CreatedAt:  time.Unix(int64(info.created_at), 0),
+
+		StartedAt: boxStartedAt,
 	}
 }
 

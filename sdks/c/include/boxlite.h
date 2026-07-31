@@ -316,6 +316,11 @@ typedef struct CBoxInfo {
   uint32_t auto_delete;
   int auto_resume;
   int64_t created_at;
+  // Unix milliseconds of the successful guest `Container.Start` for the
+  // lifecycle that owns [`Self::pid`]; `0` when this box's init was never
+  // launched. Milliseconds — not `created_at`'s seconds — because a caller
+  // comparing this against a job's timeline needs sub-second resolution.
+  int64_t started_at_unix_ms;
   // Owned typed network metadata; null when network metadata is unavailable.
   struct CNetworkInfo *network;
 } CBoxInfo;

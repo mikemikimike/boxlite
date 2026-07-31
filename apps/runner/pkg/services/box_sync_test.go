@@ -10,8 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -20,85 +18,40 @@ import (
 	"github.com/boxlite-ai/runner/pkg/models/enums"
 )
 
-// writeStartedRecord lays down the file BoxLite writes after a successful
-// guest Container.Start, in the layout box_impl.rs uses.
-func writeStartedRecord(t *testing.T, homeDir string, boxID string, contents string) {
-	t.Helper()
-	boxDir := filepath.Join(homeDir, "boxes", boxID)
-	if err := os.MkdirAll(boxDir, 0o755); err != nil {
-		t.Fatalf("create box dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(boxDir, "started"), []byte(contents), 0o644); err != nil {
-		t.Fatalf("write start record: %v", err)
-	}
-}
-
-func TestReadStartedRecord(t *testing.T) {
-	const livePID = 4242
+// boxStartedAt is the reader's whole contract now that BoxLite publishes the
+// timestamp beside the PID it belongs to: present means "this box's init was
+// launched by the lifecycle running right now", absent means it was not.
+func TestBoxStartedAt(t *testing.T) {
 	startedAt := time.UnixMilli(1_769_000_000_123)
 
 	tests := []struct {
-		name     string
-		contents string
-		// omitRecord skips writing the file entirely.
-		omitRecord bool
-		livePID    int
-		want       *time.Time
+		name string
+		info sdkboxlite.BoxInfo
+		want *time.Time
 	}{
 		{
-			name:     "record written by the live shim",
-			contents: fmt.Sprintf(`{"pid":%d,"at_unix_ms":%d}`, livePID, startedAt.UnixMilli()),
-			livePID:  livePID,
-			want:     &startedAt,
+			name: "box reports a confirmed container start",
+			info: sdkboxlite.BoxInfo{ID: "box-1", PID: 4242, StartedAt: startedAt},
+			want: &startedAt,
 		},
 		{
-			name:     "record left by a previous shim",
-			contents: fmt.Sprintf(`{"pid":%d,"at_unix_ms":%d}`, livePID-1, startedAt.UnixMilli()),
-			livePID:  livePID,
-			want:     nil,
-		},
-		{
-			name:       "no record at all",
-			omitRecord: true,
-			livePID:    livePID,
-			want:       nil,
-		},
-		{
-			name:     "truncated record",
-			contents: `{"pid":4242,"at_un`,
-			livePID:  livePID,
-			want:     nil,
-		},
-		{
-			name:     "record without a timestamp",
-			contents: fmt.Sprintf(`{"pid":%d}`, livePID),
-			livePID:  livePID,
-			want:     nil,
-		},
-		{
-			name:     "box has no live pid",
-			contents: fmt.Sprintf(`{"pid":%d,"at_unix_ms":%d}`, livePID, startedAt.UnixMilli()),
-			livePID:  0,
-			want:     nil,
+			name: "running box whose init was never launched",
+			info: sdkboxlite.BoxInfo{ID: "box-1", PID: 4242},
+			want: nil,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			homeDir := t.TempDir()
-			if !tt.omitRecord {
-				writeStartedRecord(t, homeDir, "box-1", tt.contents)
-			}
-
-			got := readStartedRecord(homeDir, "box-1", tt.livePID)
+			got := boxStartedAt(tt.info)
 
 			switch {
 			case tt.want == nil && got != nil:
-				t.Fatalf("readStartedRecord() = %s, want nil", got)
+				t.Fatalf("boxStartedAt() = %s, want nil", got)
 			case tt.want != nil && got == nil:
-				t.Fatalf("readStartedRecord() = nil, want %s", tt.want)
+				t.Fatalf("boxStartedAt() = nil, want %s", tt.want)
 			case tt.want != nil && !got.Equal(*tt.want):
-				t.Fatalf("readStartedRecord() = %s, want %s", got, tt.want)
+				t.Fatalf("boxStartedAt() = %s, want %s", got, tt.want)
 			}
 		})
 	}
@@ -199,7 +152,6 @@ func (s *runnerAPIStub) handler(t *testing.T) http.Handler {
 func newSyncServiceForTest(
 	server *httptest.Server,
 	reader boxStateReader,
-	homeDir string,
 ) *BoxSyncService {
 	config := apiclient.NewConfiguration()
 	config.Servers = apiclient.ServerConfigurations{{URL: server.URL}}
@@ -208,31 +160,22 @@ func newSyncServiceForTest(
 	return &BoxSyncService{
 		log:     slog.Default(),
 		boxlite: reader,
-		homeDir: homeDir,
 		client:  apiclient.NewAPIClient(config),
 	}
 }
 
-func TestPerformSyncConfirmsTransitionalBoxOnlyWithAStartRecord(t *testing.T) {
+func TestPerformSyncConfirmsTransitionalBoxOnlyWithAConfirmedStart(t *testing.T) {
 	tests := []struct {
 		name          string
-		writeRecord   bool
-		recordPID     int
+		startedAt     time.Time
 		wantStateSent bool
 	}{
-		{name: "start record matches the live shim", writeRecord: true, recordPID: 77, wantStateSent: true},
-		{name: "no start record", writeRecord: false, wantStateSent: false},
-		{name: "start record names a dead shim", writeRecord: true, recordPID: 76, wantStateSent: false},
+		{name: "container start confirmed", startedAt: time.Now(), wantStateSent: true},
+		{name: "running but init never launched", wantStateSent: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			homeDir := t.TempDir()
-			if tt.writeRecord {
-				writeStartedRecord(t, homeDir, "box-1",
-					fmt.Sprintf(`{"pid":%d,"at_unix_ms":%d}`, tt.recordPID, time.Now().UnixMilli()))
-			}
-
 			api := &runnerAPIStub{
 				startedBoxes: []map[string]any{},
 				transitionalBoxes: []map[string]any{
@@ -243,11 +186,16 @@ func TestPerformSyncConfirmsTransitionalBoxOnlyWithAStartRecord(t *testing.T) {
 			defer server.Close()
 
 			reader := &stubBoxReader{
-				infos:  []sdkboxlite.BoxInfo{{ID: "box-1", State: sdkboxlite.StateRunning, PID: 77}},
+				infos: []sdkboxlite.BoxInfo{{
+					ID:        "box-1",
+					State:     sdkboxlite.StateRunning,
+					PID:       77,
+					StartedAt: tt.startedAt,
+				}},
 				states: map[string]enums.BoxState{"box-1": enums.BoxStateStarted},
 			}
 
-			service := newSyncServiceForTest(server, reader, homeDir)
+			service := newSyncServiceForTest(server, reader)
 			if err := service.PerformSync(context.Background()); err != nil {
 				t.Fatalf("PerformSync: %v", err)
 			}
@@ -280,7 +228,7 @@ func TestPerformSyncStillReconcilesStartedBoxesWhenTransitionalQueryIsRejected(t
 		states: map[string]enums.BoxState{"box-gone": enums.BoxStateStopped},
 	}
 
-	service := newSyncServiceForTest(server, reader, t.TempDir())
+	service := newSyncServiceForTest(server, reader)
 	if err := service.PerformSync(context.Background()); err != nil {
 		t.Fatalf("PerformSync must not fail when the transitional query is rejected: %v", err)
 	}

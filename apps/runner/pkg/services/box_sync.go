@@ -6,11 +6,8 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"time"
 
 	apiclient "github.com/boxlite-ai/boxlite/libs/api-client-go"
@@ -36,7 +33,6 @@ type BoxSyncServiceConfig struct {
 type BoxSyncService struct {
 	log      *slog.Logger
 	boxlite  boxStateReader
-	homeDir  string
 	interval time.Duration
 	client   *apiclient.APIClient
 }
@@ -54,7 +50,6 @@ func NewBoxSyncService(config BoxSyncServiceConfig) *BoxSyncService {
 	return &BoxSyncService{
 		log:      config.Logger.With(slog.String("component", "box_sync_service")),
 		boxlite:  config.Boxlite,
-		homeDir:  config.Boxlite.HomeDir(),
 		interval: config.Interval,
 	}
 }
@@ -78,50 +73,28 @@ func (s *BoxSyncService) GetLocalContainerStates(ctx context.Context) (map[strin
 			continue
 		}
 
-		// The record lives under BoxLite's own id for the box, which is not
-		// always the key the control plane uses (that one prefers the name).
 		boxStates[boxId] = localContainerState{
 			state:     state,
-			startedAt: readStartedRecord(s.homeDir, box.ID, box.PID),
+			startedAt: boxStartedAt(box),
 		}
 	}
 
 	return boxStates, nil
 }
 
-// startedRecord mirrors StartedRecord in src/boxlite/src/runtime/layout.rs,
-// written by BoxLite once a box's guest Container.Start returns success.
-type startedRecord struct {
-	PID      int   `json:"pid"`
-	AtUnixMs int64 `json:"at_unix_ms"`
-}
-
-// readStartedRecord returns when BoxLite last confirmed a successful
-// Container.Start for the shim currently running this box, or nil when there
-// is no such evidence.
+// boxStartedAt reports when BoxLite confirmed a successful Container.Start for
+// the lifecycle this box is running right now, or nil when there is no such
+// confirmation.
 //
-// The PID cross-check is what makes the record trustworthy: BoxLite clears it
-// at the start of every new lifecycle, and pairing it with the box's live PID
-// closes the remaining window where a record could survive the shim it names.
-func readStartedRecord(homeDir string, boxID string, livePID int) *time.Time {
-	if homeDir == "" || boxID == "" || livePID <= 0 {
+// BoxLite publishes the timestamp beside the PID it belongs to and voids it in
+// the same write that publishes a new lifecycle's PID, so a value that arrives
+// here always describes the shim the box is running — the reader has nothing to
+// cross-check.
+func boxStartedAt(box sdkboxlite.BoxInfo) *time.Time {
+	if box.StartedAt.IsZero() {
 		return nil
 	}
-
-	contents, err := os.ReadFile(filepath.Join(homeDir, "boxes", boxID, "started"))
-	if err != nil {
-		return nil
-	}
-
-	var record startedRecord
-	if err := json.Unmarshal(contents, &record); err != nil {
-		return nil
-	}
-	if record.PID != livePID || record.AtUnixMs <= 0 {
-		return nil
-	}
-
-	startedAt := time.UnixMilli(record.AtUnixMs)
+	startedAt := box.StartedAt
 	return &startedAt
 }
 

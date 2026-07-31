@@ -232,6 +232,23 @@ pub struct BoxState {
     /// keeps existing DB rows readable without migration.
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// When the guest's `Container.Start` returned success for the lifecycle
+    /// that published [`Self::pid`] (docker's `State.StartedAt`).
+    ///
+    /// Deliberately not derivable from [`Self::status`]: booting only *creates*
+    /// the container, and `attach()` leaves a box `Running` with its init not
+    /// yet launched, so `Running` alone cannot answer "did this box's init
+    /// ever start". Survives a stop the way docker keeps `StartedAt` on an
+    /// exited container.
+    ///
+    /// **Invariant — the value belongs to the PID in the same row.** It is
+    /// cleared in the one write that publishes a new lifecycle's PID (see
+    /// `BoxImpl::init_live_state`) and in the one recovery branch that can
+    /// adopt a PID the row did not publish, so a reader never has to pair it
+    /// with anything. Serde default keeps existing DB rows readable without
+    /// migration.
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
 }
 
 /// Health status of a box.
@@ -331,7 +348,31 @@ impl BoxState {
             health_status: HealthStatus::new(),
             error_reason: None,
             exit_code: None,
+            started_at: None,
         }
+    }
+
+    /// Record that this lifecycle's `Container.Start` returned success.
+    pub fn mark_started(&mut self) {
+        let now = Utc::now();
+        self.started_at = Some(now);
+        self.last_updated = now;
+    }
+
+    /// Adopt a live shim that recovery found on disk.
+    ///
+    /// The one place a PID can enter this row without having been published by
+    /// the boot that owns it: a crash between the shim writing its PID file and
+    /// the row being saved leaves the two naming different lifecycles. A
+    /// `started_at` written for the PID we are replacing cannot describe the
+    /// one we are adopting, so it goes with it — that is what lets every reader
+    /// take the timestamp at face value.
+    pub fn adopt_recovered_shim(&mut self, pid: u32) {
+        if self.pid != Some(pid) {
+            self.started_at = None;
+        }
+        self.set_pid(Some(pid));
+        self.set_status(BoxStatus::Running);
     }
 
     /// Set lock ID and update timestamp.
@@ -408,6 +449,9 @@ impl BoxState {
             self.status = BoxStatus::Stopped;
         }
         self.pid = None;
+        // The reboot took every shim with it, so no init this record could
+        // describe is still running.
+        self.started_at = None;
         self.last_updated = Utc::now();
     }
 
@@ -1013,5 +1057,60 @@ mod tests {
         assert_eq!(state.health_status.state, HealthState::None);
         assert_eq!(state.health_status.failures, 0);
         assert!(state.health_status.last_check.is_none());
+        assert!(
+            state.started_at.is_none(),
+            "a row written before this field existed cannot claim a launched init"
+        );
+    }
+
+    #[test]
+    fn adopting_the_recorded_shim_keeps_its_container_start() {
+        let mut state = BoxState::new();
+        state.set_pid(Some(4242));
+        state.mark_started();
+        let recorded = state.started_at;
+
+        state.adopt_recovered_shim(4242);
+
+        assert_eq!(
+            state.started_at, recorded,
+            "recovery re-attaching the same shim must not void the start it recorded"
+        );
+        assert_eq!(state.status, BoxStatus::Running);
+    }
+
+    #[test]
+    fn adopting_a_different_shim_voids_the_container_start() {
+        // A crash between the shim writing its PID file and this row being
+        // saved leaves recovery adopting a PID the row never published. The
+        // timestamp describes the PID it was written with, so it cannot
+        // survive that swap — every consumer reads the two as one fact.
+        let mut state = BoxState::new();
+        state.set_pid(Some(4242));
+        state.mark_started();
+
+        state.adopt_recovered_shim(4243);
+
+        assert_eq!(state.pid, Some(4243));
+        assert!(
+            state.started_at.is_none(),
+            "a start recorded for pid 4242 must not be read as evidence about pid 4243"
+        );
+    }
+
+    #[test]
+    fn a_reboot_voids_the_container_start() {
+        let mut state = BoxState::new();
+        state.set_pid(Some(4242));
+        state.set_status(BoxStatus::Running);
+        state.mark_started();
+
+        state.reset_for_reboot();
+
+        assert_eq!(state.status, BoxStatus::Stopped);
+        assert!(
+            state.started_at.is_none(),
+            "the reboot took every shim with it; no recorded init is still running"
+        );
     }
 }
